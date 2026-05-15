@@ -2,6 +2,12 @@ name: Pylint
 
 on: [push, pull_request]
 
+env:
+  # Force javascript actions (checkout, setup-python) to run on Node.js 24
+  # ahead of GitHub Actions' default switch in June 2026. Drop this once
+  # v6 of the actions ships with Node 24 baked in.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
