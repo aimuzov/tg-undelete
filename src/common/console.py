@@ -12,8 +12,9 @@ through a colourless Console so the on-disk text stays grep-friendly.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import re
-from typing import Optional, TextIO
+from typing import Optional
 
 from rich.console import Console
 from rich.text import Text
@@ -22,19 +23,9 @@ from rich.text import Text
 STDOUT_CONSOLE: Console = Console(highlight=False, soft_wrap=False)
 
 
-_FILE_HANDLES: dict[str, TextIO] = {}
 _FILE_CONSOLES: dict[str, Console] = {}
-
-
-def _close_handles() -> None:
-    for fh in _FILE_HANDLES.values():
-        try:
-            fh.close()
-        except Exception:
-            pass
-
-
-atexit.register(_close_handles)
+_FILE_STACK: contextlib.ExitStack = contextlib.ExitStack()
+atexit.register(_FILE_STACK.close)
 
 
 def get_file_console(path: str) -> Console:
@@ -42,8 +33,7 @@ def get_file_console(path: str) -> Console:
     cached = _FILE_CONSOLES.get(path)
     if cached is not None:
         return cached
-    fh = open(path, "a", encoding="utf-8")
-    _FILE_HANDLES[path] = fh
+    fh = _FILE_STACK.enter_context(open(path, "a", encoding="utf-8"))
     console = Console(
         file=fh,
         no_color=True,
@@ -70,18 +60,22 @@ def _prefixed(label: str, label_style: str, message: str) -> Text:
 
 
 def info(message: str) -> None:
+    """Print an info-level status line in blue."""
     STDOUT_CONSOLE.print(_prefixed("info", "blue", message))
 
 
 def success(message: str) -> None:
+    """Print a success-level status line in green."""
     STDOUT_CONSOLE.print(_prefixed("ok", "green", message))
 
 
 def warn(message: str) -> None:
+    """Print a warning-level status line in yellow."""
     STDOUT_CONSOLE.print(_prefixed("warn", "yellow", message))
 
 
 def error(message: str, *, log_path: Optional[str] = None) -> None:
+    """Print an error-level status line; optionally mirror it to ``log_path``."""
     STDOUT_CONSOLE.print(_prefixed("error", "red", message))
     if log_path:
         # File copy stays plain — strip rich markup before writing.

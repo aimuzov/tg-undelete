@@ -32,21 +32,130 @@ BORDER_BY_STATUS: dict[Status, str] = {
 
 
 @dataclass
-class RenderedMessage:
-    """Display-ready snapshot of a message (or media album)."""
+class MessageHeader:
+    """Author + time + edited flag rendered on the panel title row."""
 
     author: str
     when: str  # "11:55 · 2025 May 12"
-    edited: bool
-    body: Text
-    reply_author: Optional[str] = None
-    reply_text: Optional[str] = None
+    edited: bool = False
+
+
+@dataclass
+class ReplyInfo:
+    """Quoted reply shown above the body, if any."""
+
+    author: Optional[str] = None
+    text: Optional[str] = None
+
+
+@dataclass
+class MessageFooter:
+    """Footer-area details: media line, reactions, status note, lot ids."""
+
     media_summary: list[str] = field(default_factory=list)
     reactions: Optional[str] = None  # plain like "❤️×3 👍×2"
     note: Optional[str] = None
     lot_ids: Sequence[int] = ()
     progress_label: Optional[str] = None  # "12/847"
-    status: Status = "normal"
+
+
+@dataclass(init=False)
+class RenderedMessage:
+    """Display-ready snapshot of a message (or media album).
+
+    Accepts the same flat ``author=..., when=..., body=..., ...`` keyword
+    arguments as before for backwards compatibility with both callers.
+    Internally fields are grouped into :class:`MessageHeader`,
+    :class:`ReplyInfo` and :class:`MessageFooter`; the original flat
+    attribute names are exposed as read-only properties.
+    """
+
+    header: MessageHeader
+    body: Text
+    reply: ReplyInfo
+    footer: MessageFooter
+    status: Status
+
+    # Flat keyword-only constructor preserved so both callers (backup and
+    # resender) can stay on the same `RenderedMessage(author=..., when=...)`
+    # signature without learning the new nested dataclasses.
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        *,
+        author: str,
+        when: str,
+        body: Text,
+        edited: bool = False,
+        reply_author: Optional[str] = None,
+        reply_text: Optional[str] = None,
+        media_summary: Optional[list[str]] = None,
+        reactions: Optional[str] = None,
+        note: Optional[str] = None,
+        lot_ids: Sequence[int] = (),
+        progress_label: Optional[str] = None,
+        status: Status = "normal",
+    ) -> None:
+        self.header = MessageHeader(author=author, when=when, edited=edited)
+        self.body = body
+        self.reply = ReplyInfo(author=reply_author, text=reply_text)
+        self.footer = MessageFooter(
+            media_summary=list(media_summary) if media_summary else [],
+            reactions=reactions,
+            note=note,
+            lot_ids=lot_ids,
+            progress_label=progress_label,
+        )
+        self.status = status
+
+    @property
+    def author(self) -> str:
+        """Author display name (delegates to :attr:`header`)."""
+        return self.header.author
+
+    @property
+    def when(self) -> str:
+        """Formatted timestamp (delegates to :attr:`header`)."""
+        return self.header.when
+
+    @property
+    def edited(self) -> bool:
+        """Whether the message has been edited (delegates to :attr:`header`)."""
+        return self.header.edited
+
+    @property
+    def reply_author(self) -> Optional[str]:
+        """Quoted-reply author, if any (delegates to :attr:`reply`)."""
+        return self.reply.author
+
+    @property
+    def reply_text(self) -> Optional[str]:
+        """Quoted-reply text, if any (delegates to :attr:`reply`)."""
+        return self.reply.text
+
+    @property
+    def media_summary(self) -> list[str]:
+        """Short Russian labels for attached media (delegates to :attr:`footer`)."""
+        return self.footer.media_summary
+
+    @property
+    def reactions(self) -> Optional[str]:
+        """Plain reactions string (delegates to :attr:`footer`)."""
+        return self.footer.reactions
+
+    @property
+    def note(self) -> Optional[str]:
+        """Optional status note shown below the body (delegates to :attr:`footer`)."""
+        return self.footer.note
+
+    @property
+    def lot_ids(self) -> Sequence[int]:
+        """Telegram message ids covered by this rendering (delegates to :attr:`footer`)."""
+        return self.footer.lot_ids
+
+    @property
+    def progress_label(self) -> Optional[str]:
+        """Progress indicator like ``"12/847"`` (delegates to :attr:`footer`)."""
+        return self.footer.progress_label
 
 
 def _quoted(text: Text, color: str = "cyan") -> Text:
@@ -79,20 +188,20 @@ def _clip(text: Text, max_lines: int = MAX_BODY_LINES) -> Text:
 def _title(rm: RenderedMessage) -> Text:
     t = Text()
     t.append("👤 ", style="bold")
-    t.append(rm.author, style="bold cyan")
+    t.append(rm.header.author, style="bold cyan")
     t.append("  ·  ", style="dim")
-    t.append(rm.when, style="dim")
-    if rm.edited:
+    t.append(rm.header.when, style="dim")
+    if rm.header.edited:
         t.append("  (ред.)", style="dim italic")
     return t
 
 
 def _subtitle(rm: RenderedMessage) -> Optional[Text]:
     parts: list[Text] = []
-    if rm.progress_label:
-        parts.append(Text(f"lot {rm.progress_label}", style="dim"))
-    if rm.lot_ids:
-        ids = ", ".join(str(i) for i in rm.lot_ids)
+    if rm.footer.progress_label:
+        parts.append(Text(f"lot {rm.footer.progress_label}", style="dim"))
+    if rm.footer.lot_ids:
+        ids = ", ".join(str(i) for i in rm.footer.lot_ids)
         parts.append(Text(f"ids=[{ids}]", style="dim"))
     if not parts:
         return None
@@ -114,13 +223,13 @@ def render_message_panel(rm: RenderedMessage) -> Panel:
     """
     blocks: list[RenderableType] = []
 
-    if rm.reply_author or rm.reply_text:
+    if rm.reply.author or rm.reply.text:
         head = Text("↪ ", style="cyan")
-        if rm.reply_author:
-            head.append(rm.reply_author, style="bold")
+        if rm.reply.author:
+            head.append(rm.reply.author, style="bold")
             head.append(": ", style="dim")
-        if rm.reply_text:
-            head.append(rm.reply_text, style="italic")
+        if rm.reply.text:
+            head.append(rm.reply.text, style="italic")
         blocks.append(_quoted(head, color="cyan"))
         blocks.append(Text())  # blank spacer
 
@@ -128,23 +237,23 @@ def render_message_panel(rm: RenderedMessage) -> Panel:
     if len(body) > 0:
         blocks.append(body)
 
-    if rm.media_summary:
+    if rm.footer.media_summary:
         media_line = Text()
         media_line.append("📎 ", style="bold")
-        media_line.append(" · ".join(rm.media_summary), style="magenta")
+        media_line.append(" · ".join(rm.footer.media_summary), style="magenta")
         if blocks:
             blocks.append(Text())
         blocks.append(media_line)
 
-    if rm.reactions:
+    if rm.footer.reactions:
         if blocks:
             blocks.append(Text())
-        blocks.append(Text(rm.reactions, style="dim"))
+        blocks.append(Text(rm.footer.reactions, style="dim"))
 
-    if rm.note:
+    if rm.footer.note:
         if blocks:
             blocks.append(Text())
-        blocks.append(Text(rm.note, style="yellow italic"))
+        blocks.append(Text(rm.footer.note, style="yellow italic"))
 
     if not blocks:
         blocks.append(Text("[пустое сообщение]", style="dim italic"))
@@ -190,24 +299,24 @@ def render_message_oneline(rm: RenderedMessage) -> Text:
 
     out = Text()
     out.append(badge_label, style=badge_style)
-    if rm.lot_ids:
+    if rm.footer.lot_ids:
         out.append(" #")
-        out.append(",".join(str(i) for i in rm.lot_ids), style="cyan")
+        out.append(",".join(str(i) for i in rm.footer.lot_ids), style="cyan")
     out.append(" · ", style="dim")
-    out.append(rm.when, style="dim")
+    out.append(rm.header.when, style="dim")
     out.append(" · ", style="dim")
-    out.append(rm.author, style="bold")
+    out.append(rm.header.author, style="bold")
     body_preview = _flatten_one_line(rm.body)
     if body_preview:
         out.append(' · "', style="dim")
         out.append(body_preview)
         out.append('"', style="dim")
-    if rm.media_summary:
+    if rm.footer.media_summary:
         out.append(" · ", style="dim")
-        out.append("📎 " + ",".join(rm.media_summary), style="magenta")
-    if rm.note:
+        out.append("📎 " + ",".join(rm.footer.media_summary), style="magenta")
+    if rm.footer.note:
         out.append(" · ", style="dim")
-        out.append(rm.note, style="yellow")
+        out.append(rm.footer.note, style="yellow")
     return out
 
 

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 from .console import STDOUT_CONSOLE, info, prompt_text
 
