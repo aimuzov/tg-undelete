@@ -1,0 +1,7 @@
+[tool.pylint.main]
+fail-under = 10.0
+ignore-paths = ["^src/resender/.*$"]
+init-hook = "import sys, os; sys.path.insert(0, os.getcwd())"
+
+[tool.pylint.format]
+max-line-length = 100

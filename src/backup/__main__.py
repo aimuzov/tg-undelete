@@ -40,13 +40,16 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
+
+import questionary
 
 from telethon import TelegramClient
 from telethon.tl.types import PeerChannel
 from telethon.errors import RPCError, FileReferenceExpiredError
 
-from src.common.backup_layout import chat_layout, prompt_chat_id
+from src.common.backup_layout import ChatLayout, chat_layout, prompt_chat_id
 from src.common.checkbox import undelete_checkbox
 from src.common.console import (
     STDOUT_CONSOLE,
@@ -62,7 +65,15 @@ from src.common.message_view import (
     render_summary_table,
 )
 from src.common.progress import make_lot_progress
-from src.common.telethon_adapter import build_rendered_from_telethon
+from src.common.telethon_adapter import TelethonRenderCtx, build_rendered_from_telethon
+from src.common.types import (
+    DownloadRequest,
+    ExportCounters,
+    ExportFlags,
+    ExportPaths,
+    ExportRange,
+    FinalReportContext,
+)
 
 
 # ---------- defaults & constants ----------
@@ -75,6 +86,10 @@ MISSING_LOG_FILENAME: str = "backup_missing_media.log"
 
 # Save state every N processed events so a kill -9 loses at most that many ids.
 STATE_FLUSH_EVERY: int = 25
+
+# Number of admin-log events per Telegram API request. 100 is the cap that
+# `iter_admin_log` accepts before silently downgrading.
+ADMIN_LOG_BATCH_SIZE: int = 100
 
 USER_NAME_CACHE: dict[int, str] = {}
 
@@ -142,11 +157,7 @@ def format_eta(seconds: float) -> str:
 
 async def safe_download_media(
     client: TelegramClient,
-    media,
-    file_path: str,
-    failed: Optional[list] = None,
-    permanent: Optional[list] = None,
-    error_log: Optional[str] = None,
+    request: DownloadRequest,
 ) -> Optional[str]:
     """
     Downloads media, surviving Telegram timeouts and other transient errors.
@@ -155,109 +166,219 @@ async def safe_download_media(
     ``ValueError('Request was unsuccessful 6 time(s)')``. Without protection,
     one broken file aborts the whole export. Failures are logged and, if
     the corresponding list is provided, recorded for a later retry pass
-    (``failed``) or reported as unrecoverable (``permanent``).
+    (``request.failed``) or reported as unrecoverable (``request.permanent``).
 
     Skips the download if a file at ``<file_path>.<ext>`` already exists on
     disk — useful when re-running with mode=1 to capture media metadata into
     the dump without re-downloading the bytes.
     """
-    existing = glob.glob(file_path + ".*")
+    existing = glob.glob(request.file_path + ".*")
     if existing:
         info(f"skipping download, already on disk: [dim]{existing[0]}[/dim]")
         return existing[0]
     try:
-        return await client.download_media(media, file_path)
+        return await client.download_media(request.media, request.file_path)
     except DOWNLOAD_PERMANENT_ERRORS as exc:
         error(
-            f"permanently failed for {file_path}: {exc}. not retrying.",
-            log_path=error_log,
+            f"permanently failed for {request.file_path}: {exc}. not retrying.",
+            log_path=request.error_log,
         )
-        if permanent is not None:
-            permanent.append((file_path, str(exc)))
+        if request.permanent is not None:
+            request.permanent.append((request.file_path, str(exc)))
         return None
     except DOWNLOAD_RETRYABLE_ERRORS as exc:
-        warn(f"failed to download media for {file_path}: {exc}. skipping.")
-        if failed is not None:
-            failed.append((media, file_path))
+        warn(f"failed to download media for {request.file_path}: {exc}. skipping.")
+        if request.failed is not None:
+            request.failed.append((request.media, request.file_path))
         return None
+
+
+@dataclass
+class _RetrySettings:
+    """Tunables and sinks for :func:`retry_failed_downloads`."""
+
+    permanent: Optional[list] = None
+    error_log: Optional[str] = None
+    max_rounds: int = 3
+    base_delay: float = 2.0
+
+
+@dataclass
+class _RetryRound:
+    """Per-iteration metadata for :func:`_run_one_retry_round`."""
+
+    round_num: int
+    max_rounds: int
+    permanent: Optional[list]
+    error_log: Optional[str]
+
+
+async def _run_one_retry_round(
+    client: TelegramClient,
+    failed: list,
+    round_: _RetryRound,
+) -> list:
+    """Retries each pending download once; returns items still failing."""
+    next_failed: list = []
+    total = len(failed)
+    with make_lot_progress() as progress:
+        task = progress.add_task(
+            f"retry pass {round_.round_num}/{round_.max_rounds}", total=total
+        )
+        for idx, (media, file_path) in enumerate(failed, 1):
+            try:
+                await client.download_media(media, file_path)
+                success(f"\\[{idx}/{total}] recovered: {file_path}")
+            except DOWNLOAD_PERMANENT_ERRORS as exc:
+                error(
+                    f"\\[{idx}/{total}] permanently failed for {file_path}: "
+                    f"{exc}. dropping from retry queue.",
+                    log_path=round_.error_log,
+                )
+                if round_.permanent is not None:
+                    round_.permanent.append((file_path, str(exc)))
+            except DOWNLOAD_RETRYABLE_ERRORS as exc:
+                warn(f"\\[{idx}/{total}] still failing for {file_path}: {exc}")
+                next_failed.append((media, file_path))
+            progress.update(task, advance=1)
+            await asyncio.sleep(0.3)  # Be gentle with the API between items
+    return next_failed
 
 
 async def retry_failed_downloads(
     client: TelegramClient,
     failed: list,
-    permanent: Optional[list] = None,
-    error_log: Optional[str] = None,
-    max_rounds: int = 3,
-    base_delay: float = 2.0,
+    settings: _RetrySettings,
 ) -> list:
     """
     Retries previously failed downloads in several rounds with exponential
     backoff between rounds. Permanent errors encountered during retries are
-    moved to ``permanent`` (if provided) and removed from the retry queue.
-    Returns the list of items that still failed transiently.
+    moved to ``settings.permanent`` (if provided) and removed from the retry
+    queue. Returns the list of items that still failed transiently.
     """
-    for round_num in range(1, max_rounds + 1):
+    for round_num in range(1, settings.max_rounds + 1):
         if not failed:
             return []
-
-        delay = base_delay * (2 ** (round_num - 1))
+        delay = settings.base_delay * (2 ** (round_num - 1))
         info(
-            f"retry pass [bold]{round_num}/{max_rounds}[/bold]: "
+            f"retry pass [bold]{round_num}/{settings.max_rounds}[/bold]: "
             f"{len(failed)} item(s) to retry (sleeping {delay:.0f}s first)..."
         )
         await asyncio.sleep(delay)
-
-        next_failed: list = []
-        total = len(failed)
-        with make_lot_progress() as progress:
-            task = progress.add_task(f"retry pass {round_num}/{max_rounds}", total=total)
-            for idx, (media, file_path) in enumerate(failed, 1):
-                try:
-                    await client.download_media(media, file_path)
-                    success(f"\\[{idx}/{total}] recovered: {file_path}")
-                except DOWNLOAD_PERMANENT_ERRORS as exc:
-                    error(
-                        f"\\[{idx}/{total}] permanently failed for {file_path}: "
-                        f"{exc}. dropping from retry queue.",
-                        log_path=error_log,
-                    )
-                    if permanent is not None:
-                        permanent.append((file_path, str(exc)))
-                except DOWNLOAD_RETRYABLE_ERRORS as exc:
-                    warn(f"\\[{idx}/{total}] still failing for {file_path}: {exc}")
-                    next_failed.append((media, file_path))
-                progress.update(task, advance=1)
-                await asyncio.sleep(0.3)  # Be gentle with the API between items
-
-        failed = next_failed
-
+        failed = await _run_one_retry_round(
+            client,
+            failed,
+            _RetryRound(
+                round_num=round_num,
+                max_rounds=settings.max_rounds,
+                permanent=settings.permanent,
+                error_log=settings.error_log,
+            ),
+        )
     return failed
 
 
 # ---------- core export ----------
 
 
+@dataclass
+class _ExportRequest:
+    """Inputs that don't change during one export: ids, files, flags, state."""
+
+    target_group_id: int
+    paths: ExportPaths
+    flags: ExportFlags
+    range_: ExportRange
+    state: dict[str, Any]
+
+
+@dataclass
+class _TelethonHandles:
+    """Live Telethon objects threaded through the per-event pipeline."""
+
+    client: TelegramClient
+    group: Any
+    progress: Any
+    dump: Optional[Any] = None
+
+
+@dataclass
+class _PassContext:
+    """Shared state for one main-pass loop over admin-log events."""
+
+    handles: _TelethonHandles
+    flags: ExportFlags
+    counters: ExportCounters
+    paths: ExportPaths
+    range_: ExportRange
+    state: dict[str, Any]
+    events_seen: int = 0
+
+
+def _init_counters(state: dict[str, Any]) -> ExportCounters:
+    """Build :class:`ExportCounters` seeded from persisted resume state."""
+    return ExportCounters(
+        saved_ids=set(state.get("saved_ids", [])),
+        permanent_failures=list(state.get("permanent_failures", [])),
+    )
+
+
+def _flush_state(state: dict[str, Any], counters: ExportCounters, state_path: str) -> None:
+    """Persist ``counters`` into ``state`` and write it atomically."""
+    state["saved_ids"] = sorted(counters.saved_ids)
+    state["permanent_failures"] = counters.permanent_failures
+    save_state(state_path, state)
+
+
+def _open_dump_if_needed(
+    stack: contextlib.ExitStack,
+    paths: ExportPaths,
+    *,
+    dry_run: bool,
+) -> Optional[Any]:
+    """Open ``messages.json`` for append/create unless this is a dry-run."""
+    if dry_run:
+        return None
+    file_mode: str = "a" if os.path.exists(paths.messages) else "w"
+    return stack.enter_context(open(paths.messages, file_mode, encoding="utf-8"))
+
+
+async def _run_export_passes(
+    client: TelegramClient,
+    group: Any,
+    dump: Optional[Any],
+    request: _ExportRequest,
+    counters: ExportCounters,
+) -> list:
+    """Drive the main + retry passes; return items still failing transiently."""
+    with make_lot_progress() as progress:
+        ctx = _PassContext(
+            handles=_TelethonHandles(
+                client=client, group=group, progress=progress, dump=dump
+            ),
+            flags=request.flags,
+            counters=counters,
+            paths=request.paths,
+            range_=request.range_,
+            state=request.state,
+        )
+        await _run_main_pass(ctx)
+    return await _run_retry_pass(
+        client,
+        counters,
+        request.paths.error_log,
+        dry_run=request.flags.dry_run,
+    )
+
+
 async def export_messages(
     client: TelegramClient,
-    target_group_id: int,
-    mode: int,
-    *,
-    messages_path: str,
-    media_folder: str,
-    state: dict[str, Any],
-    state_path: str,
-    error_log: str,
-    missing_log: str,
-    min_id: int = 0,
-    max_id: int = 0,
-    dry_run: bool = False,
-    limit: Optional[int] = None,
-    verbose: bool = False,
+    request: _ExportRequest,
 ) -> None:
     """
     Exports deleted messages from a Telegram group or channel.
 
-    The two checkbox flags are orthogonal:
+    The two checkbox flags inside ``request.flags`` are orthogonal:
 
     * ``save_text`` (mode 1 or 3) — write every deleted message into
       ``messages.json`` (with full media metadata when present, but without
@@ -266,303 +387,214 @@ async def export_messages(
       isn't yet in ``messages.json``, it gets appended too — so a media-only
       run "back-fills" the JSON for the media events it touches.
 
-    Resume: ``state["saved_ids"]`` lists message ids already in the JSON.
-    A re-run never appends a duplicate JSON object, but media downloads are
-    re-attempted only when the file is missing on disk
+    Resume: ``request.state["saved_ids"]`` lists message ids already in the
+    JSON. A re-run never appends a duplicate JSON object, but media downloads
+    are re-attempted only when the file is missing on disk
     (``safe_download_media`` skips if a file at ``<id>.<ext>`` already exists).
 
-    With ``dry_run=True`` no on-disk side effects happen: the dump file stays
-    untouched, media is not downloaded, but every event still gets a Rich
-    preview.
+    With ``request.flags.dry_run=True`` no on-disk side effects happen: the
+    dump file stays untouched, media is not downloaded, but every event still
+    gets a Rich preview.
     """
-    group: PeerChannel = await client.get_entity(PeerChannel(target_group_id))
-
-    save_text = mode in (1, 3)
-    save_media = mode in (1, 2)
-
-    saved_ids: set[int] = set(state.get("saved_ids", []))
-    permanent_failures: list = list(state.get("permanent_failures", []))
-    failed_downloads: list = []
-    permanent_count_before = len(permanent_failures)
-
-    counts: dict[str, int] = {"messages": 0, "media": 0, "skipped": 0}
+    group = await client.get_entity(PeerChannel(request.target_group_id))
+    counters = _init_counters(request.state)
+    permanent_count_before = len(counters.permanent_failures)
     start_ts = time.monotonic()
     still_failed: list = []
 
     with contextlib.ExitStack() as stack:
-        dump: Optional[Any] = None
-        if not dry_run:
-            # Either flag may write into messages.json — text writes everything,
-            # media-only back-fills records for downloaded media — so always open
-            # the file when not in dry-run.
-            file_mode: str = "a" if os.path.exists(messages_path) else "w"
-            dump = stack.enter_context(
-                open(messages_path, file_mode, encoding="utf-8")
-            )
-
+        dump = _open_dump_if_needed(stack, request.paths, dry_run=request.flags.dry_run)
         try:
-            with make_lot_progress() as progress:
-                await _run_main_pass(
-                    client,
-                    group,
-                    progress,
-                    save_text=save_text,
-                    save_media=save_media,
-                    saved_ids=saved_ids,
-                    failed_downloads=failed_downloads,
-                    permanent_failures=permanent_failures,
-                    counts=counts,
-                    dump=dump,
-                    state=state,
-                    state_path=state_path,
-                    media_folder=media_folder,
-                    error_log=error_log,
-                    min_id=min_id,
-                    max_id=max_id,
-                    dry_run=dry_run,
-                    limit=limit,
-                    verbose=verbose,
-                )
-
-            still_failed = await _run_retry_pass(
-                client,
-                failed_downloads,
-                permanent_failures,
-                error_log,
-                dry_run=dry_run,
+            still_failed = await _run_export_passes(
+                client, group, dump, request, counters
             )
-
             _log_permanent_failures(
-                permanent_failures, permanent_count_before, missing_log
+                counters.permanent_failures,
+                permanent_count_before,
+                request.paths.missing_log,
             )
         finally:
-            if not dry_run:
-                state["saved_ids"] = sorted(saved_ids)
-                state["permanent_failures"] = permanent_failures
-                save_state(state_path, state)
+            if not request.flags.dry_run:
+                _flush_state(request.state, counters, request.paths.state_path)
 
-    elapsed = time.monotonic() - start_ts
     _render_final_report(
-        counts=counts,
-        permanent_failures=permanent_failures,
-        still_failed=still_failed,
-        state_path=state_path,
-        missing_log=missing_log,
-        error_log=error_log,
-        elapsed=elapsed,
-        dry_run=dry_run,
+        FinalReportContext(
+            counters=counters,
+            still_failed=still_failed,
+            paths=request.paths,
+            elapsed=time.monotonic() - start_ts,
+            dry_run=request.flags.dry_run,
+        )
     )
 
 
-# Number of admin-log events per Telegram API request. 100 is the cap that
-# `iter_admin_log` accepts before silently downgrading.
-ADMIN_LOG_BATCH_SIZE: int = 100
+async def _fetch_admin_log_batch(ctx: _PassContext) -> list:
+    """Pull one page of deleted-message admin-log events."""
+    return [
+        event
+        async for event in ctx.handles.client.iter_admin_log(
+            ctx.handles.group,
+            min_id=ctx.range_.min_id or 0,
+            max_id=ctx.range_.max_id or 0,
+            limit=ADMIN_LOG_BATCH_SIZE,
+            delete=True,
+        )
+    ]
 
 
-async def _run_main_pass(
-    client: TelegramClient,
-    group: Any,
-    progress: Any,
-    *,
-    save_text: bool,
-    save_media: bool,
-    saved_ids: set[int],
-    failed_downloads: list,
-    permanent_failures: list,
-    counts: dict[str, int],
-    dump: Optional[Any],
-    state: dict[str, Any],
-    state_path: str,
-    media_folder: str,
-    error_log: str,
-    min_id: int,
-    max_id: int,
-    dry_run: bool,
-    limit: Optional[int],
-    verbose: bool,
-) -> None:
-    """Pulls deletion events page-by-page and dispatches each to the per-event
-    handler. Stops on empty page, reaching min_id, or hitting --limit."""
-    task_id = progress.add_task("Exporting deleted events", total=None)
-    events_seen = 0  # Events that produced a write (drives state-flush cadence)
+def _limit_reached(counters: ExportCounters, limit: Optional[int]) -> bool:
+    """True if ``--limit`` would be exceeded by the next event."""
+    if limit is None:
+        return False
+    return (counters.counts["messages"] + counters.counts["media"]) >= limit
 
+
+async def _run_main_pass(ctx: _PassContext) -> None:
+    """Pulls deletion events page-by-page and dispatches each to the
+    per-event handler. Stops on empty page, reaching min_id, or hitting
+    ``flags.limit``."""
+    task_id = ctx.handles.progress.add_task("Exporting deleted events", total=None)
     try:
         while True:
-            events = [
-                event
-                async for event in client.iter_admin_log(
-                    group,
-                    min_id=min_id or 0,
-                    max_id=max_id or 0,
-                    limit=ADMIN_LOG_BATCH_SIZE,
-                    delete=True,  # Interested only in deleted messages
-                )
-            ]
-
+            events = await _fetch_admin_log_batch(ctx)
             if not events:
                 success("loading complete, no new messages.")
                 return
 
-            stop = False
             for event in events:
-                progress.update(task_id, advance=1)
-                events_seen = await _process_event(
-                    event,
-                    client=client,
-                    progress=progress,
-                    save_text=save_text,
-                    save_media=save_media,
-                    saved_ids=saved_ids,
-                    failed_downloads=failed_downloads,
-                    permanent_failures=permanent_failures,
-                    counts=counts,
-                    events_seen=events_seen,
-                    dump=dump,
-                    state=state,
-                    state_path=state_path,
-                    media_folder=media_folder,
-                    error_log=error_log,
-                    min_id=min_id,
-                    dry_run=dry_run,
-                    verbose=verbose,
-                )
-                if limit is not None and (counts["messages"] + counts["media"]) >= limit:
-                    warn(f"reached --limit {limit}, stopping.")
-                    stop = True
-                    break
+                ctx.handles.progress.update(task_id, advance=1)
+                await _process_event(event, ctx)
+                if _limit_reached(ctx.counters, ctx.flags.limit):
+                    warn(f"reached --limit {ctx.flags.limit}, stopping.")
+                    return
 
-            if stop:
-                return
-
-            max_id = events[-1].id - 1  # Exclude last received event from next request
-            if max_id < min_id:
+            # Exclude last received event from next request.
+            ctx.range_.max_id = events[-1].id - 1
+            if ctx.range_.max_id < ctx.range_.min_id:
                 info("reached the lower message id limit.")
                 return
-
     except RPCError as exc:
         reason = f"{type(exc).__name__}: {exc}"
-        error(f"an error occurred: {reason}", log_path=error_log)
-        append_line(error_log, reason)
+        error(f"an error occurred: {reason}", log_path=ctx.paths.error_log)
+        append_line(ctx.paths.error_log, reason)
 
 
-async def _process_event(
-    event: Any,
-    *,
-    client: TelegramClient,
-    progress: Any,
-    save_text: bool,
-    save_media: bool,
-    saved_ids: set[int],
-    failed_downloads: list,
-    permanent_failures: list,
-    counts: dict[str, int],
-    events_seen: int,
-    dump: Optional[Any],
-    state: dict[str, Any],
-    state_path: str,
-    media_folder: str,
-    error_log: str,
-    min_id: int,
-    dry_run: bool,
-    verbose: bool,
-) -> int:
-    """Processes one admin-log event: appends to JSON dump, downloads media,
-    prints a preview. Returns the updated `events_seen` counter so the caller
-    keeps flush cadence in sync."""
-    if not (event.deleted_message and event.old.id >= min_id):
-        return events_seen
-
+def _event_actions(event: Any, ctx: _PassContext) -> tuple[bool, bool]:
+    """Return ``(write_json, download_media)`` for this event."""
     has_media = event.old.media is not None
+    json_eligible = ctx.flags.save_text or (ctx.flags.save_media and has_media)
+    write_json = json_eligible and event.old.id not in ctx.counters.saved_ids
+    download_media = ctx.flags.save_media and has_media
+    return write_json, download_media
 
-    # Eligibility (what *would* happen ignoring resume state):
-    #   text-checkbox → write everything
-    #   media-checkbox → also write media events (so the JSON
-    #                    learns about them when text wasn't run)
-    json_eligible = save_text or (save_media and has_media)
-    write_json = json_eligible and event.old.id not in saved_ids
-    download_media = save_media and has_media
 
+def _write_event_json(event: Any, ctx: _PassContext) -> str:
+    """Append the event to the dump and update counters. Returns a note bit."""
+    if not ctx.flags.dry_run and ctx.handles.dump is not None:
+        ctx.handles.dump.write(event.old.to_json() + ",")
+    ctx.counters.counts["messages"] += 1
+    ctx.counters.saved_ids.add(event.old.id)
+    verb = "preview" if ctx.flags.dry_run else "saved"
+    return f"{verb} #{ctx.counters.counts['messages']}"
+
+
+async def _download_event_media(event: Any, ctx: _PassContext) -> tuple[Optional[str], str]:
+    """Download (or fake-download in dry-run) media; return path and note bit."""
+    if ctx.flags.dry_run:
+        ctx.counters.counts["media"] += 1
+        return None, f"preview media #{ctx.counters.counts['media']}"
+    download_path = await safe_download_media(
+        ctx.handles.client,
+        DownloadRequest(
+            media=event.old.media,
+            file_path=os.path.join(ctx.paths.media_folder, str(event.old.id)),
+            failed=ctx.counters.failed_downloads,
+            permanent=ctx.counters.permanent_failures,
+            error_log=ctx.paths.error_log,
+        ),
+    )
+    if download_path is None:
+        return None, ""
+    ctx.counters.counts["media"] += 1
+    return download_path, f"media #{ctx.counters.counts['media']}"
+
+
+async def _render_event(event: Any, ctx: _PassContext, note_bits: list[str]) -> None:
+    """Paint a Rich preview line/panel for the processed event."""
+    rendered = await build_rendered_from_telethon(
+        event.old,
+        TelethonRenderCtx(
+            client=ctx.handles.client,
+            user_cache=USER_NAME_CACHE,
+            note=" + ".join(note_bits) if note_bits else None,
+        ),
+    )
+    if ctx.flags.verbose:
+        ctx.handles.progress.console.print(render_message_panel(rendered))
+    else:
+        ctx.handles.progress.console.print(render_message_oneline(rendered))
+
+
+async def _process_event(event: Any, ctx: _PassContext) -> None:
+    """Processes one admin-log event: appends to JSON dump, downloads media,
+    prints a preview. Mutates ``ctx`` in place."""
+    if not (event.deleted_message and event.old.id >= ctx.range_.min_id):
+        return
+
+    write_json, download_media = _event_actions(event, ctx)
     if not write_json and not download_media:
-        counts["skipped"] += 1
-        return events_seen
+        ctx.counters.counts["skipped"] += 1
+        return
 
     note_bits: list[str] = []
-
     if write_json:
-        if not dry_run and dump is not None:
-            dump.write(event.old.to_json() + ",")
-        counts["messages"] += 1
-        saved_ids.add(event.old.id)
-        note_bits.append(f"{'preview' if dry_run else 'saved'} #{counts['messages']}")
+        note_bits.append(_write_event_json(event, ctx))
 
     download_path: Optional[str] = None
     if download_media:
-        if not dry_run:
-            download_path = await safe_download_media(
-                client,
-                event.old.media,
-                os.path.join(media_folder, str(event.old.id)),
-                failed=failed_downloads,
-                permanent=permanent_failures,
-                error_log=error_log,
-            )
-            if download_path is not None:
-                counts["media"] += 1
-                note_bits.append(f"media #{counts['media']}")
-        else:
-            counts["media"] += 1
-            note_bits.append(f"preview media #{counts['media']}")
+        download_path, note = await _download_event_media(event, ctx)
+        if note:
+            note_bits.append(note)
 
-    rendered = await build_rendered_from_telethon(
-        event.old,
-        client=client,
-        user_cache=USER_NAME_CACHE,
-        note=" + ".join(note_bits) if note_bits else None,
-    )
-    if verbose:
-        progress.console.print(render_message_panel(rendered))
-    else:
-        progress.console.print(render_message_oneline(rendered))
+    await _render_event(event, ctx, note_bits)
 
     if download_path is not None:
         success(
-            f"saved media #{counts['media']} (id: {event.old.id}, "
+            f"saved media #{ctx.counters.counts['media']} (id: {event.old.id}, "
             f"file: [dim]{download_path}[/dim])"
         )
 
     if write_json:
-        events_seen += 1
-        if not dry_run and events_seen % STATE_FLUSH_EVERY == 0:
-            state["saved_ids"] = sorted(saved_ids)
-            state["permanent_failures"] = permanent_failures
-            save_state(state_path, state)
+        ctx.events_seen += 1
+        if not ctx.flags.dry_run and ctx.events_seen % STATE_FLUSH_EVERY == 0:
+            _flush_state(ctx.state, ctx.counters, ctx.paths.state_path)
 
     await asyncio.sleep(0.1)  # Short pause to avoid flooding API
-    return events_seen
 
 
 async def _run_retry_pass(
     client: TelegramClient,
-    failed_downloads: list,
-    permanent_failures: list,
+    counters: ExportCounters,
     error_log: str,
     *,
     dry_run: bool,
 ) -> list:
     """Retries any media that hit a transient error during the main pass.
     Prints a summary of what remains broken. No-op in dry-run."""
-    if not failed_downloads or dry_run:
+    failed = counters.failed_downloads
+    if not failed or dry_run:
         return []
-
     warn(
-        f"main pass finished with [bold]{len(failed_downloads)}[/bold] "
+        f"main pass finished with [bold]{len(failed)}[/bold] "
         f"transient failure(s). starting retry pass."
     )
     still_failed = await retry_failed_downloads(
         client,
-        failed_downloads,
-        permanent=permanent_failures,
-        error_log=error_log,
+        failed,
+        _RetrySettings(
+            permanent=counters.permanent_failures,
+            error_log=error_log,
+        ),
     )
     if still_failed:
         warn(f"{len(still_failed)} item(s) still failing transiently:")
@@ -582,7 +614,6 @@ def _log_permanent_failures(
     that were already on disk from previous runs are not re-logged."""
     if not permanent_failures:
         return
-
     error(
         f"{len(permanent_failures)} item(s) permanently unavailable "
         f"(expired references or self-destructing media):"
@@ -593,30 +624,26 @@ def _log_permanent_failures(
         append_line(missing_log, f"{file_path}\t{reason}")
 
 
-def _render_final_report(
-    *,
-    counts: dict[str, int],
-    permanent_failures: list,
-    still_failed: list,
-    state_path: str,
-    missing_log: str,
-    error_log: str,
-    elapsed: float,
-    dry_run: bool,
-) -> None:
-    """Renders the run summary table at the end of `export_messages`."""
+def _build_report_footer(ctx: FinalReportContext) -> list[str]:
+    """Compose the per-run footer of the summary table."""
     footer: list[str] = []
-    if not dry_run:
-        footer.append(f"State: {state_path}")
-    if os.path.exists(missing_log):
-        footer.append(f"Missing media log: {missing_log}")
-    if os.path.exists(error_log):
-        footer.append(f"Errors log: {error_log}")
+    if not ctx.dry_run:
+        footer.append(f"State: {ctx.paths.state_path}")
+    if os.path.exists(ctx.paths.missing_log):
+        footer.append(f"Missing media log: {ctx.paths.missing_log}")
+    if os.path.exists(ctx.paths.error_log):
+        footer.append(f"Errors log: {ctx.paths.error_log}")
+    return footer
 
-    title_prefix = "Backup dry-run complete" if dry_run else "Backup complete"
+
+def _render_final_report(ctx: FinalReportContext) -> None:
+    """Renders the run summary table at the end of :func:`export_messages`."""
+    footer = _build_report_footer(ctx)
+    counts = ctx.counters.counts
+    title_prefix = "Backup dry-run complete" if ctx.dry_run else "Backup complete"
     STDOUT_CONSOLE.print(
         render_summary_table(
-            title=f"{title_prefix} in {format_eta(elapsed)}",
+            title=f"{title_prefix} in {format_eta(ctx.elapsed)}",
             rows=[
                 ("Saved messages", str(counts["messages"]), "bold green"),
                 ("Saved media", str(counts["media"]), "bold green"),
@@ -627,13 +654,13 @@ def _render_final_report(
                 ),
                 (
                     "Transient failures (unrecovered)",
-                    str(len(still_failed)),
-                    "yellow" if still_failed else "dim",
+                    str(len(ctx.still_failed)),
+                    "yellow" if ctx.still_failed else "dim",
                 ),
                 (
                     "Permanent failures",
-                    str(len(permanent_failures)),
-                    "red" if permanent_failures else "dim",
+                    str(len(ctx.counters.permanent_failures)),
+                    "red" if ctx.counters.permanent_failures else "dim",
                 ),
             ],
             footer=footer or None,
@@ -648,18 +675,8 @@ async def prompt_export_mode() -> int:
     """Interactive checkbox picker — returns 1 (all), 2 (media only), 3 (text only).
 
     Both items checked → mode 1; only media → 2; only text → 3. An empty
-    selection re-prompts. Falls back to plain numeric input if `questionary`
-    is unavailable.
+    selection re-prompts.
     """
-    try:
-        import questionary
-    except ImportError:
-        warn(
-            "questionary is not installed; falling back to text input. "
-            "run `pip install questionary` for the checkbox UI."
-        )
-        return _prompt_export_mode_text()
-
     while True:
         choices = await undelete_checkbox(
             "What to export from deleted messages?",
@@ -689,22 +706,6 @@ async def prompt_export_mode() -> int:
         if "text" in selected:
             return 3
         warn("pick at least one option.")
-
-
-def _prompt_export_mode_text() -> int:
-    """Plain-input fallback for environments without questionary."""
-    while True:
-        raw = prompt_text(
-            "Enter export mode (1 - all, 2 - media only, 3 - text only):"
-        ).strip()
-        try:
-            value = int(raw)
-        except ValueError:
-            STDOUT_CONSOLE.print(f"  [red]Bad input '{raw}', expected 1-3.[/red]")
-            continue
-        if value in (1, 2, 3):
-            return value
-        STDOUT_CONSOLE.print(f"  [red]Out of range, expected 1-3 (got {value}).[/red]")
 
 
 def parse_cli_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -801,39 +802,35 @@ def parse_cli_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-async def main(argv: Optional[list[str]] = None) -> None:
-    """Async entry point for ``python -m src.backup``.
+@dataclass
+class _ResolvedRun:
+    """User-supplied or interactively-resolved inputs for one backup run."""
 
-    Parses CLI flags, prompts for anything the user omitted (api creds,
-    chat id, export mode), resolves the on-disk :class:`ChatLayout`,
-    starts a Telethon session and delegates the actual export to
-    :func:`export_messages`. The Telethon client is always disconnected
-    via ``try/finally`` so the session file stays consistent on Ctrl+C.
-    """
-    args = parse_cli_args(argv)
+    api_id: int
+    api_hash: str
+    chat_id: int
+    mode: int
+    range_: ExportRange = field(default_factory=ExportRange)
+    verbose: bool = False
 
-    if args.no_color:
-        STDOUT_CONSOLE.no_color = True
 
-    verbose = args.verbose or os.environ.get(
-        "TG_BACKUP_VERBOSE", ""
-    ).strip() not in ("", "0", "false", "False")
+def _resolve_verbose(args: argparse.Namespace) -> bool:
+    """Resolve verbose mode from CLI flag + ``TG_BACKUP_VERBOSE`` env var."""
+    env = os.environ.get("TG_BACKUP_VERBOSE", "").strip()
+    return args.verbose or env not in ("", "0", "false", "False")
 
+
+def _resolve_credentials(args: argparse.Namespace) -> tuple[int, str]:
+    """Prompt for api credentials if missing on the command line."""
     api_id = args.api_id
     if api_id is None:
         api_id = int(prompt_text("Enter your api_id:").strip())
     api_hash = args.api_hash or prompt_text("Enter your api_hash:").strip()
+    return api_id, api_hash
 
-    chat_id = args.chat_id
-    if chat_id is None:
-        # Offer existing backups first so the user can resume into one of
-        # them; falls back to free-text entry for a brand-new chat.
-        chat_id = prompt_chat_id(args.output_folder, action="backup")
 
-    mode = args.mode
-    if mode is None:
-        mode = await prompt_export_mode()
-
+def _resolve_range(args: argparse.Namespace) -> ExportRange:
+    """Prompt for min/max id range bounds if missing on the command line."""
     min_id = args.min_id
     if min_id is None:
         raw = prompt_text(
@@ -846,22 +843,52 @@ async def main(argv: Optional[list[str]] = None) -> None:
             "Enter the maximum message ID (0 to retrieve all):"
         ).strip()
         max_id = int(raw) if raw else 0
+    return ExportRange(min_id=min_id, max_id=max_id)
 
-    # Layout: <output-folder>/<chat-id>/{messages.json, media/, *.log, *.json}
-    layout = chat_layout(args.output_folder, chat_id)
-    layout.ensure()
 
-    state_path = os.path.join(layout.chat_dir, STATE_FILENAME)
-    error_log = os.path.join(layout.chat_dir, ERROR_LOG_FILENAME)
-    missing_log = os.path.join(layout.chat_dir, MISSING_LOG_FILENAME)
-    info(f"backup folder: [bold]{layout.chat_dir}[/bold]")
+async def _resolve_inputs(args: argparse.Namespace) -> _ResolvedRun:
+    """Collect every interactive prompt up-front so the export call is pure."""
+    api_id, api_hash = _resolve_credentials(args)
+    chat_id = args.chat_id
+    if chat_id is None:
+        chat_id = prompt_chat_id(args.output_folder, action="backup")
+    mode = args.mode
+    if mode is None:
+        mode = await prompt_export_mode()
+    return _ResolvedRun(
+        api_id=api_id,
+        api_hash=api_hash,
+        chat_id=chat_id,
+        mode=mode,
+        range_=_resolve_range(args),
+        verbose=_resolve_verbose(args),
+    )
 
-    session_file = f"{args.session_name}.session"
-    if args.reset_session and os.path.exists(session_file):
-        os.remove(session_file)
-        info(f"existing session file removed: [bold]{session_file}[/bold]")
 
-    state = load_state(state_path)
+def _build_paths(layout: ChatLayout) -> ExportPaths:
+    """Materialise per-chat file paths into an :class:`ExportPaths` bundle."""
+    return ExportPaths(
+        messages=layout.messages,
+        media_folder=layout.media,
+        state_path=os.path.join(layout.chat_dir, STATE_FILENAME),
+        error_log=os.path.join(layout.chat_dir, ERROR_LOG_FILENAME),
+        missing_log=os.path.join(layout.chat_dir, MISSING_LOG_FILENAME),
+    )
+
+
+def _build_flags(args: argparse.Namespace, mode: int, verbose: bool) -> ExportFlags:
+    """Translate CLI/interactive answers into an :class:`ExportFlags` bundle."""
+    return ExportFlags(
+        save_text=mode in (1, 3),
+        save_media=mode in (1, 2),
+        dry_run=args.dry_run,
+        verbose=verbose,
+        limit=args.limit,
+    )
+
+
+def _log_state_summary(state: dict[str, Any]) -> None:
+    """Print resume-state highlights so the user sees what's preloaded."""
     if state["saved_ids"]:
         info(
             f"state loaded: [bold]{len(state['saved_ids'])}[/bold] "
@@ -873,36 +900,73 @@ async def main(argv: Optional[list[str]] = None) -> None:
             f"permanent failures recorded."
         )
 
+
+def _confirm_or_abort(args: argparse.Namespace) -> bool:
+    """Return ``True`` if the export may proceed, ``False`` if user aborted."""
     if args.dry_run:
         info(
             "[bold yellow]dry-run mode[/bold yellow]: messages.json will not be "
             "written, no media will be downloaded."
         )
-    elif not args.yes:
-        # Default is YES — pressing Enter accepts. Type "n" to abort.
-        answer = prompt_text("Proceed? (Y/n)").strip().lower()
-        if answer and answer not in ("y", "yes", "д", "да"):
-            warn("aborted.")
-            return
+        return True
+    if args.yes:
+        return True
+    # Default is YES — pressing Enter accepts. Type "n" to abort.
+    answer = prompt_text("Proceed? (Y/n)").strip().lower()
+    if answer and answer not in ("y", "yes", "д", "да"):
+        warn("aborted.")
+        return False
+    return True
 
-    client: TelegramClient = TelegramClient(args.session_name, api_id, api_hash)
+
+def _maybe_reset_session(args: argparse.Namespace) -> None:
+    """Delete the session file when ``--reset-session`` was passed."""
+    session_file = f"{args.session_name}.session"
+    if args.reset_session and os.path.exists(session_file):
+        os.remove(session_file)
+        info(f"existing session file removed: [bold]{session_file}[/bold]")
+
+
+async def main(argv: Optional[list[str]] = None) -> None:
+    """Async entry point for ``python -m src.backup``.
+
+    Parses CLI flags, prompts for anything the user omitted (api creds,
+    chat id, export mode), resolves the on-disk :class:`ChatLayout`,
+    starts a Telethon session and delegates the actual export to
+    :func:`export_messages`. The Telethon client is always disconnected
+    via ``try/finally`` so the session file stays consistent on Ctrl+C.
+    """
+    args = parse_cli_args(argv)
+    if args.no_color:
+        STDOUT_CONSOLE.no_color = True
+
+    run = await _resolve_inputs(args)
+
+    layout = chat_layout(args.output_folder, run.chat_id)
+    layout.ensure()
+    paths = _build_paths(layout)
+    info(f"backup folder: [bold]{layout.chat_dir}[/bold]")
+
+    _maybe_reset_session(args)
+    state = load_state(paths.state_path)
+    _log_state_summary(state)
+
+    if not _confirm_or_abort(args):
+        return
+
+    flags = _build_flags(args, run.mode, run.verbose)
+    client = TelegramClient(args.session_name, run.api_id, run.api_hash)
     await client.start()
     try:
         await export_messages(
             client,
-            chat_id,
-            mode,
-            messages_path=layout.messages,
-            media_folder=layout.media,
-            state=state,
-            state_path=state_path,
-            error_log=error_log,
-            missing_log=missing_log,
-            min_id=min_id,
-            max_id=max_id,
-            dry_run=args.dry_run,
-            limit=args.limit,
-            verbose=verbose,
+            _ExportRequest(
+                target_group_id=run.chat_id,
+                paths=paths,
+                flags=flags,
+                range_=run.range_,
+                state=state,
+            ),
         )
     finally:
         await client.disconnect()

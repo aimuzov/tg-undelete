@@ -53,6 +53,38 @@ def _utf16_to_char_index(text: str) -> list[int]:
     return mapping
 
 
+def _apply_entity(
+    result: Text,
+    entity: dict,
+    u2c: list[int],
+    n_units: int,
+    styles: dict[str, str],
+) -> None:
+    """Apply one Telegram entity's style to ``result`` in-place."""
+    kind = entity.get("_")
+    style = styles.get(kind)
+    if style is None:
+        return
+    offset = entity.get("offset") or 0
+    length = entity.get("length") or 0
+    if length <= 0:
+        return
+    u_start = max(0, min(offset, n_units))
+    u_end = max(u_start, min(offset + length, n_units))
+    c_start = u2c[u_start]
+    c_end = u2c[u_end]
+    if c_end <= c_start:
+        return
+    # For TextUrl, also embed an OSC-8 hyperlink — clickable in modern
+    # terminals (iTerm2, recent VS Code, kitty, wezterm).
+    if kind == "MessageEntityTextUrl":
+        url = entity.get("url") or ""
+        if url:
+            result.stylize(f"underline blue link {url}", c_start, c_end)
+            return
+    result.stylize(style, c_start, c_end)
+
+
 def render_entities_to_text(
     text: str,
     entities: Optional[list[dict]],
@@ -86,27 +118,6 @@ def render_entities_to_text(
         entities,
         key=lambda e: (e.get("offset") or 0, -(e.get("length") or 0)),
     )
-    for e in sorted_e:
-        t = e.get("_")
-        style = styles.get(t)
-        if style is None:
-            continue
-        offset = e.get("offset") or 0
-        length = e.get("length") or 0
-        if length <= 0:
-            continue
-        u_start = max(0, min(offset, n_units))
-        u_end = max(u_start, min(offset + length, n_units))
-        c_start = u2c[u_start]
-        c_end = u2c[u_end]
-        if c_end <= c_start:
-            continue
-        # For TextUrl, also embed an OSC-8 hyperlink — clickable in modern
-        # terminals (iTerm2, recent VS Code, kitty, wezterm).
-        if t == "MessageEntityTextUrl":
-            url = e.get("url") or ""
-            if url:
-                result.stylize(f"underline blue link {url}", c_start, c_end)
-                continue
-        result.stylize(style, c_start, c_end)
+    for entity in sorted_e:
+        _apply_entity(result, entity, u2c, n_units, styles)
     return result
